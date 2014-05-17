@@ -369,16 +369,15 @@ fits_read_pix(f::FITSFile, data::Array) = fits_read_pix(f, ones(Int,length(size(
 function fits_copy_image_section(fin::FITSFile, fout::FITSFile,
                                  section::String)
     status = Int32[0]
-    ccall((:fits_copy_image_section,:libcfitsio), Int32,
+    ccall((:fits_copy_image_section,libcfitsio), Int32,
           (Ptr{Void}, Ptr{Void}, Ptr{Uint8}, Ptr{Int32}),
           fin.ptr, fout.ptr, bytestring(section), status)
     fits_assert_ok(status[1])
 end
-rangestr(r::Range1) = @sprintf "%d:%d" first(r) last(r)
-rangestr(r::Range) = @sprintf "%d:%d:%d" first(r) last(r) step(r)
-rangestr(r) = join([rangestr(ri) for ri in r], ',') 
+range2str(r::Range1) = @sprintf "%d:%d" first(r) last(r)
+range2str(r::Range) = @sprintf "%d:%d:%d" first(r) last(r) step(r)
 fits_copy_image_section(fin::FITSFile, fout::FITSFile, r...) =
-    fits_copy_image_section(fin, fout, rangestr(r))
+    fits_copy_image_section(fin, fout, join([range2str(ri) for ri in r], ','))
 
 function fitsread(filename::String)
     f = fits_open_file(filename)

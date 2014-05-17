@@ -160,6 +160,17 @@ Primary Array Routines
 
    Read pixels from the FITS file into ``data``.
 
+.. function:: fits_copy_image_section(fin::FITSFile, fout::FITSFile, seection::String)
+.. function:: fits_copy_image_section(fin::FITSFile, fout::FITSFile, r...)
+
+   Copy a subsection of an image from file ``fin`` to file
+   ``fout``. In the first form, ``section`` is a string specifying the
+   range according to the `cfitsio conventions`_. The second form
+   specifies ranges along the image axes. For example,
+   ``fits_copy_image_section(fin, fout, 2:2:10, 6:20)`` takes even
+   indicies in x from 2 to 10 and y indicies from 6 to 20.
+
+.. _`cfitsio conventions`: http://heasarc.gsfc.nasa.gov/docs/software/fitsio/c/c_user/node94.html
 
 Table Routines
 --------------
