@@ -43,13 +43,32 @@ export FITSFile,
 
 export fitsread
 
-import Base: close, show
+# ------------------------------------
+# High-level interface
+export FITS,
+       HDU,
+       ImageHDU
+
+import Base: getindex, length, show, read, write, close, ndims, size
+# ------------------------------------
 
 using BinDeps
 @BinDeps.load_dependencies
 
 type FITSFile
     ptr::Ptr{Void}
+
+    function FITSFile(ptr::Ptr{Void})
+        f = new(ptr)
+        finalizer(f, close)
+        f
+    end
+end
+
+function fits_assert_open(f::FITSFile)
+    if f.ptr == C_NULL
+        error("attempt to access closed FITS file")
+    end
 end
 
 function fits_get_errstatus(status::Int32)
@@ -97,6 +116,12 @@ end
 
 const mode_strs = [int32(0)=>"READONLY", int32(1)=>"READWRITE"]
 
+const bitpix_to_str = [int32(8)=>"BYTE_IMG", int32(16)=>"SHORT_IMG",
+                       int32(32)=>"LONG_IMG", int32(64)=>"LONGLONG_IMG",
+                       int32(-32)=>"FLOAT_IMG", int32(-64)=>"DOUBLE_IMG"]
+const bitpix_to_type = [int32(8)=>Uint8, int32(16)=>Int16,
+                        int32(32)=>Int32, int32(64)=>Int64,
+                        int32(-32)=>Float32, int32(-64)=>Float64]
 
 # General-purpose functions
 
@@ -155,11 +180,20 @@ for (a,b) in ((:fits_close_file, "ffclos"),
               (:fits_delete_file,"ffdelt"))
     @eval begin
         function ($a)(f::FITSFile)
+            
+            # fits_close_file is called during garbage collection, but the
+            # file may already be closed.
+            if f.ptr == C_NULL
+                return
+            end
+
             status = Int32[0]
             ccall(($b,libcfitsio), Int32,
                   (Ptr{Void},Ptr{Int32}),
                   f.ptr, status)
             fits_assert_ok(status[1])
+            f.ptr = C_NULL
+            nothing
         end
     end
 end
@@ -311,19 +345,45 @@ function fits_get_hdu_num(f::FITSFile)
     hdunum[1]
 end
 
+function fits_get_hdu_type(f::FITSFile)
+    hdutype = Int32[0]
+    status = Int32[0]
+    ccall((:ffghdt, libcfitsio), Int32,
+          (Ptr{Void}, Ptr{Int32}, Ptr{Int32}),
+          f.ptr, hdutype, status)
+    fits_assert_ok(status[1])
+    hdu_int_to_type(hdutype[1])
+end
+
 # primary array or IMAGE extension
 
-function fits_get_img_size(f::FITSFile)
-    naxis = Int32[0]
+function fits_get_img_type(f::FITSFile)
+    bitpix = Int32[0]
+    status = Int32[0]
+    ccall((:ffgidt,libcfitsio), Int32,
+        (Ptr{Void},Ptr{Int32},Ptr{Int32}),
+        f.ptr, bitpix, status)
+    fits_assert_ok(status[1])
+    bitpix[1]
+end
+
+function fits_get_img_dim(f::FITSFile)
+    ndim = Int32[0]
     status = Int32[0]
     ccall((:ffgidm,libcfitsio), Int32,
         (Ptr{Void},Ptr{Int32},Ptr{Int32}),
-        f.ptr, naxis, status)
+        f.ptr, ndim, status)
     fits_assert_ok(status[1])
-    naxes = zeros(Int, naxis[1])
+    ndim[1]
+end
+
+function fits_get_img_size(f::FITSFile)
+    ndim = fits_get_img_dim(f)
+    naxes = zeros(Int, ndim)
+    status = Int32[0]
     ccall((:ffgisz,libcfitsio), Int32,
         (Ptr{Void},Int32,Ptr{Int},Ptr{Int32}),
-        f.ptr, naxis[1], naxes, status)
+        f.ptr, ndim, naxes, status)
     fits_assert_ok(status[1])
     naxes
 end
@@ -354,6 +414,7 @@ function fits_read_pix{T}(f::FITSFile, fpixel::Vector{Int}, nelements::Int, null
     fits_assert_ok(status[1])
     anynull[1]
 end
+
 function fits_read_pix{T}(f::FITSFile, fpixel::Vector{Int}, nelements::Int, data::Array{T})
     anynull = Int32[0]
     status = Int32[0]
@@ -364,6 +425,22 @@ function fits_read_pix{T}(f::FITSFile, fpixel::Vector{Int}, nelements::Int, data
     anynull[1]
 end
 fits_read_pix(f::FITSFile, data::Array) = fits_read_pix(f, ones(Int,length(size(data))), length(data), data)
+
+function fits_read_subset{T}(f::FITSFile,
+                             fpixel::Vector{Clong},
+                             lpixel::Vector{Clong},
+                             inc::Vector{Clong},
+                             data::Array{T})
+    anynull = Cint[0]
+    status = Cint[0]
+    ccall((:ffgsv,libcfitsio), Cint,
+          (Ptr{Void},Cint,Ptr{Clong},Ptr{Clong},Ptr{Clong},Ptr{Void},Ptr{Void},
+           Ptr{Cint},Ptr{Cint}),
+          f.ptr, _cfitsio_datatype(T), fpixel, lpixel, inc, C_NULL, data,
+          anynull, status)
+    fits_assert_ok(status[1])
+    anynull[1]
+end
 
 function fitsread(filename::String)
     f = fits_open_file(filename)
@@ -522,28 +599,202 @@ for (a,b) in ((:fits_insert_rows, "ffirow"),
     end
 end
 
-function show(io::IO, f::FITSFile)
-    print(io, "file: ", fits_file_name(f), "\n")
-    print(io, "mode: ", mode_strs[fits_file_mode(f)], "\n")
-    print(io, "  extnum hdutype         hduname\n")
+# -----------------------------------------------------------------------------
+# High-level interface: Types
 
-    current = fits_get_hdu_num(f)  # Mark the current HDU.
+abstract HDU
 
-    for i = 1:fits_get_num_hdus(f)
-        marker = i == current ? '*' : ' '
-        hdutype = fits_movabs_hdu(f, i)
+# FITS is analagous to FITSFile, but holds a reference to all of its
+# HDU objects. This is so that only a single HDU object is created for
+# each extension in the file. It also allows a FITS object to tell
+# previously created HDUs about events that happen to the file, such 
+# as deleting extensions. This could be done by, e.g., setting ext=-1 in
+# the HDU object.
+
+type FITS
+    fitsfile::FITSFile
+    filename::String
+    mode::String
+    hdus::Dict{Int, HDU}
+
+    function FITS(filename::String, mode::String="r")
+        f = (mode == "r" ? fits_open_file(filename) :
+             mode == "r+" && isfile(filename) ? error("r/w mode not yet implemented"):
+             mode == "r+" ? fits_create_file(filename) :
+             mode == "w" ? fits_create_file("!"*filename) :
+             error("invalid open mode: $mode"))
+
+        new(f, filename, mode, Dict{Int, HDU}())
+    end
+end
+
+# TODO : Cache metadata such as extname, extver, image size and data type?
+#        This might allow faster access for size(ImageHDU) and ndim(ImageHDU)
+type ImageHDU <: HDU
+    fitsfile::FITSFile
+    ext::Int
+end
+
+type TableHDU <: HDU
+    fitsfile::FITSFile
+    ext::Int
+end
+
+type AsciiHDU <: HDU
+    fitsfile::FITSFile
+    ext::Int
+end
+
+# -----------------------------------------------------------------------------
+# FITS
+
+function length(f::FITS)
+    fits_assert_open(f.fitsfile)
+    fits_get_num_hdus(f.fitsfile)
+end
+
+endof(f::FITS) = length(f)
+
+function show(io::IO, f::FITS)
+    fits_assert_open(f.fitsfile)
+
+    print(io, "file: ", f.filename, "\n")
+    print(io, "mode: ", f.mode, "\n")
+    print(io, "extnum exttype         extname\n")
+
+    for i = 1:length(f)
+        hdutype = fits_movabs_hdu(f.fitsfile, i)
         extname = ""
         try
-            extname = fits_read_keyword(f, "EXTNAME")[1]
+            extname = fits_read_keyword(f.fitsfile, "EXTNAME")[1]
         catch
             try
-                extname = fits_read_keyword(f, "HDUNAME")[1]
+                extname = fits_read_keyword(f.fitsfile, "HDUNAME")[1]
             catch
             end
         end
-        @printf io "%c %-6d %-15s %s\n" marker i hdutype extname
+        @printf io "%-6d %-15s %s\n" i hdutype extname
     end
-    fits_movabs_hdu(f, current)  # Return to the HDU we were on.
 end
+
+# Returns HDU object based on extension number
+function getindex(f::FITS, i::Int)
+    fits_assert_open(f.fitsfile)
+
+    if haskey(f.hdus, i)
+        return f.hdus[i]
+    end
+
+    hdutype = fits_movabs_hdu(f.fitsfile, i)
+    f.hdus[i] = (hdutype == :image_hdu ? ImageHDU(f.fitsfile, i) :
+                 hdutype == :binary_table ? TableHDU(f.fitsfile, i) :
+                 hdutype == :ascii_table ? AsciiHDU(f.fitsfile, i) :
+                 error("bad HDU type"))
+    return f.hdus[i]
+end
+
+# Returns HDU based on hduname, version
+function getindex(f::FITS, name::String, ver::Int=0)
+    fits_assert_open(f.fitsfile)
+    fits_movnam_hdu(f.fitsfile, name, ver)
+    i = fits_get_hdu_num(f.fitsfile)
+
+    if haskey(f.hdus, i)
+        return f.hdus[i]
+    end
+
+    hdutype = fits_get_hdu_type(f.fitsfile)
+    f.hdus[i] = (hdutype == :image_hdu ? ImageHDU(f.fitsfile, i) :
+                 hdutype == :binary_table ? TableHDU(f.fitsfile, i) :
+                 hdutype == :ascii_table ? AsciiHDU(f.fitsfile, i) :
+                 error("bad HDU type"))
+    return f.hdus[i]
+end
+
+
+function close(f::FITS)
+    fits_assert_open(f.fitsfile)
+    fits_close_file(f.fitsfile)
+    f.filename = ""
+    f.mode = ""
+    empty!(f.hdus)
+    nothing
+end
+
+# -----------------------------------------------------------------------------
+# ImageHDU methods
+
+# Display the image datatype and dimensions
+function show(io::IO, hdu::ImageHDU)
+    fits_assert_open(hdu.fitsfile)
+    fits_movabs_hdu(hdu.fitsfile, hdu.ext)
+    bitpix = fits_get_img_type(hdu.fitsfile)
+    sz = fits_get_img_size(hdu.fitsfile)
+    @printf io "file: %s\nextension: %d\ntype: IMAGE\nimage info:\n  bitpix: %d\n  size: %s" fits_file_name(hdu.fitsfile) hdu.ext bitpix tuple(sz...)
+end
+
+# Get image dimensions
+function ndims(hdu::ImageHDU)
+    fits_assert_open(hdu.fitsfile)
+    fits_movabs_hdu(hdu.fitsfile, hdu.ext)
+    fits_get_img_dim(hdu.fitsfile)
+end
+
+# Get image size
+function size(hdu::ImageHDU)
+    fits_assert_open(hdu.fitsfile)
+    fits_movabs_hdu(hdu.fitsfile, hdu.ext)
+    sz = fits_get_img_size(hdu.fitsfile)
+    tuple(sz...)
+end
+
+function size(hdu::ImageHDU, i::Integer)
+    fits_assert_open(hdu.fitsfile)
+    fits_movabs_hdu(hdu.fitsfile, hdu.ext)
+    sz = fits_get_img_size(hdu.fitsfile)
+    sz[i]
+end
+
+# Read a full image from an HDU
+# TODO: Correct support for BSCALE'd images
+function read(hdu::ImageHDU)
+    fits_assert_open(hdu.fitsfile)
+    fits_movabs_hdu(hdu.fitsfile, hdu.ext)
+    sz = fits_get_img_size(hdu.fitsfile)
+    bitpix = fits_get_img_type(hdu.fitsfile)
+    data = Array(bitpix_to_type[bitpix], sz...)
+    fits_read_pix(hdu.fitsfile, data)
+    data
+end
+
+# Read all or a subset of an HDU
+function getindex(hdu::ImageHDU, rs::Range...)
+    fits_assert_open(hdu.fitsfile)
+    fits_movabs_hdu(hdu.fitsfile, hdu.ext)
+
+    # construct first, last and step vectors
+    firsts = Clong[first(r) for r in rs]
+    lasts = Clong[last(r) for r in rs]
+    steps = Clong[step(r) for r in rs]
+
+    # construct output array
+    bitpix = fits_get_img_type(hdu.fitsfile)
+    
+    datasz = [length(r) for r in rs]
+    data = Array(bitpix_to_type[bitpix], datasz...)
+    fits_read_subset(hdu.fitsfile, firsts, lasts, steps, data)
+    data
+end
+
+# Add a new ImageHDU to a FITS object
+function write{T}(f::FITS, data::Array{T})
+    fits_assert_open(f.fitsfile)
+    s = size(data)
+    fits_create_img(f.fitsfile, T, [s...])
+    fits_write_pix(f.fitsfile, ones(Int, length(s)), length(data), data)
+    nothing
+end
+
+# -----------------------------------------------------------------------------
 
 end # module
